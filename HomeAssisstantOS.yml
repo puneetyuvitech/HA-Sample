@@ -1,0 +1,214 @@
+---
+- name: Deploy Home Assistant OS VM on Proxmox via qm CLI (idempotent, portable)
+  hosts: localhost
+  gather_facts: no
+  vars:
+    proxmox_host: "enter_proxmox_ip_here"
+    proxmox_user: "proxmox_user_name"
+    proxmox_password: "proxmox_user_password"
+    vmid: enter_vm_id_here
+    vm_name: enetr_vm_name_here
+    storage: local-lvm
+    haos_qcow2_url: "https://github.com/home-assistant/operating-system/releases/download/16.2/haos_ova-16.2.qcow2.xz"
+    qcow2_local_path: "/var/lib/vz/template/haos_ova-16.2.qcow2"
+    memory: 4096
+    cores: 2
+    sockets: 1
+    ssh_args: "-o StrictHostKeyChecking=no"
+  
+
+  tasks:
+    - name: Ensure template directory exists
+      ansible.builtin.file:
+        path: "/var/lib/vz/template"
+        state: directory
+        mode: "0755"
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Check if HAOS qcow2.xz already exists
+      ansible.builtin.stat:
+        path: "{{ qcow2_local_path }}.xz"
+      register: haos_xz
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Download HAOS qcow2.xz if missing
+      ansible.builtin.get_url:
+        url: "{{ haos_qcow2_url }}"
+        dest: "{{ qcow2_local_path }}.xz"
+        mode: "0644"
+      when: not haos_xz.stat.exists
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Check if HAOS qcow2 already exists
+      ansible.builtin.stat:
+        path: "{{ qcow2_local_path }}"
+      register: haos_qcow2
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Decompress qcow2 only if not exists
+      ansible.builtin.shell: "unxz -k {{ qcow2_local_path }}.xz"
+      when: not haos_qcow2.stat.exists
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Create VM if not exists
+      ansible.builtin.shell: |
+        qm status {{ vmid }} >/dev/null 2>&1 || \
+        qm create {{ vmid }} \
+          --name {{ vm_name }} \
+          --memory {{ memory }} \
+          --cores {{ cores }} \
+          --sockets {{ sockets }} \
+          --net0 virtio,bridge=vmbr0 \
+          --scsihw virtio-scsi-single \
+          --bios ovmf \
+          --efidisk0 {{ storage }}:4
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Import HAOS disk if not yet imported (idempotent check)
+      ansible.builtin.shell: |
+        if ! qm config {{ vmid }} | grep -q "vm-{{ vmid }}-disk-[1-9]"; then
+          qm importdisk {{ vmid }} {{ qcow2_local_path }} {{ storage }} --format qcow2
+        fi
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Detect the latest imported vm-{{ vmid }}-disk-X on {{ storage }}
+      ansible.builtin.shell: |
+        qm config {{ vmid }} | grep 'unused' | sed -n 's/.*vm-{{ vmid }}-disk-\([0-9]\+\).*/\1/p' | sort -n | tail -1
+      register: found_disk_index
+      changed_when: false
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Fail if no imported disk was found
+      ansible.builtin.fail:
+        msg: "No imported disk found for VM {{ vmid }} on {{ storage }}. Check importdisk step."
+      when: found_disk_index.stdout | trim == ""
+
+    - name: Stop the VM before disk changes
+      ansible.builtin.shell: "qm stop {{ vmid }} || true"
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Remove wrong scsi0 if it exists
+      ansible.builtin.shell: |
+        if qm config {{ vmid }} | grep -q '^scsi0:'; then
+          qm set {{ vmid }} --delete scsi0
+        fi
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Attach imported HAOS disk as scsi0 and set boot order
+      ansible.builtin.shell: |
+        qm set {{ vmid }} --scsi0 {{ storage }}:vm-{{ vmid }}-disk-{{ found_disk_index.stdout | trim }}
+        qm set {{ vmid }} --boot order=scsi0
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Enable qemu-guest-agent on VM
+      ansible.builtin.shell: |
+        qm set {{ vmid }} --agent enabled=1
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Start the VM
+      ansible.builtin.shell: "qm start {{ vmid }}"
+      delegate_to: "{{ proxmox_host }}"
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Wait for guest agent to be available
+      ansible.builtin.shell: |
+        for i in {1..15}; do
+          qm guest cmd {{ vmid }} ping && exit 0
+          sleep 4
+        done
+        exit 1
+      delegate_to: "{{ proxmox_host }}"
+      register: guest_agent_wait
+      retries: 15
+      delay: 4
+      until: guest_agent_wait.rc == 0
+      ignore_errors: yes
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Get VM network interfaces with guest agent
+      ansible.builtin.shell: |
+        qm guest cmd {{ vmid }} network-get-interfaces
+      delegate_to: "{{ proxmox_host }}"
+      register: guest_netinfo
+      vars:
+        ansible_ssh_user: "{{ proxmox_user }}"
+        ansible_ssh_pass: "{{ proxmox_password }}"
+        ansible_ssh_common_args: "{{ ssh_args }}"
+
+    - name: Show raw guest agent output (for troubleshooting)
+      debug:
+        msg: "{{ guest_netinfo.stdout }}"
+
+    - name: Build safe list of all 'address' IPs reported by agent
+      set_fact:
+        all_vm_ips: >-
+          {{
+            guest_netinfo.stdout | from_json
+            | map(attribute='ip-addresses')
+            | sum(start=[])
+            | selectattr('ip-address', 'defined')
+            | map(attribute='ip-address')
+            | list
+          }}
+
+    - name: Pick the first 192.168.* address for the VM
+      set_fact:
+        vm_private_ip: "{{ all_vm_ips | select('search', '^192\\.168\\.') | list | first | default('NOT FOUND') }}"
+
+    - name: Show VM private IP
+      ansible.builtin.debug:
+        msg: "Home Assistant OS VM private IP: {{ vm_private_ip }}"
